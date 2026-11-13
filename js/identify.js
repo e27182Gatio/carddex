@@ -4,7 +4,7 @@
 // Both lists are merged and ranked by match.rankCandidates().
 
 import { getCard, getSetCard, getSets, pool, searchCards } from "./api.js";
-import { nameTokens, parseHp, parseNumbers, rankCandidates } from "./match.js";
+import { nameScore, nameTokens, parseHp, parseNumbers, rankCandidates, sameNumber } from "./match.js";
 
 const MAX_SET_LOOKUPS = 14;
 const MAX_DETAIL = 8;
@@ -36,7 +36,13 @@ export async function identify(read, onStep = () => {}) {
   }
 
   const tokens = nameTokens(parsed.nameText);
-  const strongByNumber = rankCandidates(found, parsed).some((c) => c.score >= 0.8);
+  // A high ranking score can come from number/HP alone, which is not enough:
+  // many expansions reuse the same collector number. Search names whenever
+  // the title does not convincingly agree with the number-based candidates.
+  const strongByNumber = found.some((c) =>
+    sameNumber(c.localId, parsed.number) &&
+    nameScore(c.name, parsed.nameText) >= 0.78 &&
+    (!parsed.total || c.set?.official === parsed.total || c.set?.total === parsed.total));
   if (tokens.length && !strongByNumber) {
     onStep(`Searching for “${tokens[0]}”…`);
     const lists = await pool(tokens.slice(0, 2), 2, (t) => searchCards({ name: t, perPage: 60 }));
