@@ -181,9 +181,7 @@ export function render(root) {
   async function capture() {
     if (!video.videoWidth || busy) return;
     paused = true;
-    if (!lastCapturedFrame) {
-      try { lastCapturedFrame = sampleFrame(); } catch { /* manual capture still works */ }
-    }
+    try { lastCapturedFrame = sampleFrame(); } catch { /* manual capture still works */ }
     const g = guideRect(video.videoWidth, video.videoHeight);
     // The guide is already a card-shaped crop. Auto-cropping it again sometimes
     // cuts off the collector number or name, causing incorrect matches.
@@ -239,7 +237,15 @@ export function render(root) {
     }
     if (!isSure(out) && reader === "ocr" && state.settings.autoAi && getApiKey()) {
       say("OCR wasn't sure. Trying Claude…");
-      return scan(canvas, { reader: "ai" });
+      try {
+        const aiRead = await readWithClaude(canvas, state.settings.model);
+        const aiOut = await identify(aiRead, (msg) => say(msg));
+        showResults(aiOut, "ai");
+      } catch (e) {
+        say("Claude could not verify this card; review the OCR alternatives.", "error");
+        showResults(out, reader);
+      }
+      return;
     }
     showResults(out, reader);
     } finally {
