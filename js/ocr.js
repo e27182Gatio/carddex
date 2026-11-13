@@ -130,17 +130,18 @@ export async function readCard(card, onProgress) {
   // Title strip: the name sits ~3–12% down, left of the HP. PSM 6 = one block of text.
   await worker.setParameters({ tessedit_pageseg_mode: "6", tessedit_char_whitelist: "" });
   const nameRes = await worker.recognize(strip(card, 0.08, 0.03, 0.62, 0.09));
-  // HP corner (top right), used to tell same-number cards apart. PSM 11 = sparse text.
-  await worker.setParameters({ tessedit_pageseg_mode: "11" });
-  const hpRes = await worker.recognize(strip(card, 0.6, 0.03, 0.38, 0.07));
-  // Collector number: bottom strip, full width (left on modern cards, right on vintage).
-  await worker.setParameters({ tessedit_char_whitelist: "0123456789/ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz " });
-  let numberText = (await worker.recognize(strip(card, 0, 0.86, 1, 0.13, 3))).data.text || "";
+  // Fast path: title + collector number are usually enough to identify a
+  // printing. Avoid OCR'ing HP on every scan; it adds latency on mobile.
+  await worker.setParameters({ tessedit_pageseg_mode: "11", tessedit_char_whitelist: "0123456789/ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz " });
+  let numberText = (await worker.recognize(strip(card, 0, 0.86, 1, 0.13, 2))).data.text || "";
   if (!parseNumbers(numberText).length) {
-    // Fall back to each half on its own: less clutter for the recogniser.
-    for (const fx of [0, 0.5]) numberText += `\n${(await worker.recognize(strip(card, fx, 0.88, 0.5, 0.11, 3))).data.text || ""}`;
+    // Read each half only when the full bottom strip wasn't legible.
+    for (const fx of [0, 0.5]) {
+      numberText += `\n${(await worker.recognize(strip(card, fx, 0.88, 0.5, 0.11, 2))).data.text || ""}`;
+      if (parseNumbers(numberText).length) break;
+    }
   }
-  return { nameText: nameRes.data.text || "", hpText: hpRes.data.text || "", numberText };
+  return { nameText: nameRes.data.text || "", hpText: "", numberText };
 }
 
 export async function warmUp(onProgress) {
