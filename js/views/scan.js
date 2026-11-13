@@ -4,7 +4,7 @@
 import { readWithClaude } from "../ai.js";
 import { h, mount } from "../dom.js";
 import { identify } from "../identify.js";
-import { nameTokens, sameNumber } from "../match.js";
+import { nameScore, nameTokens, sameNumber } from "../match.js";
 import { autoCrop, readCard, toCanvas, warmUp } from "../ocr.js";
 import { getApiKey, ownedIds, state } from "../store.js";
 import { cardSheet, cardTile } from "../ui.js";
@@ -12,8 +12,11 @@ import { cardSheet, cardTile } from "../ui.js";
 const CARD_RATIO = 63 / 88;
 let stream = null;
 let lastCanvas = null;
+let autoTimer = null;
 
 export function stopCamera() {
+  if (autoTimer != null) clearInterval(autoTimer);
+  autoTimer = null;
   if (stream) for (const t of stream.getTracks()) t.stop();
   stream = null;
 }
@@ -28,10 +31,108 @@ export function render(root) {
   const file = h("input", { type: "file", accept: "image/*", capture: "environment", class: "visually-hidden", id: "scan-file" });
 
   const camBtn = h("button", { class: "btn primary", type: "button" }, "Start camera");
-  const shotBtn = h("button", { class: "btn primary hidden", type: "button" }, "Capture card");
+  const shotBtn = h("button", { class: "btn hidden", type: "button" }, "Capture manually");
   const stopBtn = h("button", { class: "btn hidden", type: "button" }, "Stop camera");
 
-  const say = (msg, kind = "") => { status.className = `status ${kind}`; status.textContent = msg; };
+  const say = (msg, kind = "") => {
+    if (status.textContent === msg && status.className === `status ${kind}`) return;
+    status.className = `status ${kind}`;
+    status.textContent = msg;
+  };
+
+  // Analyze only a tiny frame: OCR starts after the card is sharp, well-lit and
+  // steady. The full-resolution image is used for the actual recognition.
+  const ANALYSIS_W = 48, ANALYSIS_H = 68;
+  const analysis = document.createElement("canvas");
+  analysis.width = ANALYSIS_W;
+  analysis.height = ANALYSIS_H;
+  const analysisCtx = analysis.getContext("2d", { willReadFrequently: true });
+  let previousFrame = null;
+  let lastCapturedFrame = null;
+  let stableSamples = 0;
+  let busy = false;
+  let paused = false;
+  let needsNewCard = false;
+
+  function difference(a, b) {
+    if (!a || !b) return Infinity;
+    let sum = 0;
+    for (let i = 0; i < a.length; i++) sum += Math.abs(a[i] - b[i]);
+    return sum / a.length;
+  }
+
+  function sampleFrame() {
+    if (!video.videoWidth || !video.videoHeight) return null;
+    const r = guideRect(video.videoWidth, video.videoHeight);
+    analysisCtx.drawImage(video, r.x, r.y, r.w, r.h, 0, 0, ANALYSIS_W, ANALYSIS_H);
+    const rgba = analysisCtx.getImageData(0, 0, ANALYSIS_W, ANALYSIS_H).data;
+    const pixels = new Uint8Array(ANALYSIS_W * ANALYSIS_H);
+    let brightness = 0, edges = 0, count = 0;
+    for (let y = 0; y < ANALYSIS_H; y++) {
+      for (let x = 0; x < ANALYSIS_W; x++) {
+        const i = y * ANALYSIS_W + x;
+        const p = i * 4;
+        const v = Math.round(0.299 * rgba[p] + 0.587 * rgba[p + 1] + 0.114 * rgba[p + 2]);
+        pixels[i] = v;
+        brightness += v;
+        if (x && y) {
+          edges += (Math.abs(v - pixels[i - 1]) + Math.abs(v - pixels[i - ANALYSIS_W])) / 2;
+          count++;
+        }
+      }
+    }
+    return { pixels, brightness: brightness / pixels.length, detail: edges / Math.max(1, count) };
+  }
+
+  function monitorFrame() {
+    if (!stream || busy || paused || document.hidden) return;
+    let frame;
+    try { frame = sampleFrame(); } catch { return; }
+    if (!frame) return;
+
+    if (needsNewCard) {
+      // After saving, don't immediately scan the same card a second time.
+      if (difference(frame.pixels, lastCapturedFrame?.pixels) < 18) {
+        previousFrame = frame;
+        return;
+      }
+      needsNewCard = false;
+      previousFrame = null;
+    }
+
+    const motion = difference(frame.pixels, previousFrame?.pixels);
+    previousFrame = frame;
+    if (frame.brightness < 35 || frame.brightness > 235 || frame.detail < 8) {
+      stableSamples = 0;
+      guide.classList.remove("ready");
+      say("Auto scan: centre a well-lit card inside the outline.");
+      return;
+    }
+    stableSamples = motion < 10 ? stableSamples + 1 : 0;
+    guide.classList.toggle("ready", stableSamples > 0);
+    if (stableSamples < 2) {
+      say("Auto scan: hold the card steady inside the outline.");
+      return;
+    }
+    paused = true;
+    stableSamples = 0;
+    lastCapturedFrame = frame;
+    guide.classList.remove("ready");
+    guide.classList.add("scanning");
+    capture();
+  }
+
+  function resumeAutoScan() {
+    if (!stream || busy) return;
+    previousFrame = null;
+    stableSamples = 0;
+    paused = false;
+    needsNewCard = false;
+    results.replaceChildren();
+    preview.replaceChildren();
+    guide.classList.remove("scanning", "ready");
+    say("Auto scan ready. Hold a card steady in the outline.");
+  }
 
   function layoutGuide() {
     const vw = video.videoWidth, vh = video.videoHeight;
@@ -51,16 +152,25 @@ export function render(root) {
     }
     video.srcObject = stream;
     video.addEventListener("loadedmetadata", layoutGuide, { once: true });
+    video.play().catch(() => {});
     stage.classList.remove("hidden");
     camBtn.classList.add("hidden");
     shotBtn.classList.remove("hidden");
     stopBtn.classList.remove("hidden");
-    say("Fill the frame with the card, upright, without glare. Then capture.");
+    paused = false;
+    needsNewCard = false;
+    previousFrame = null;
+    stableSamples = 0;
+    say("Auto scan enabled. Centre the card and hold it steady — no tap needed.");
+    if (autoTimer != null) clearInterval(autoTimer);
+    autoTimer = setInterval(monitorFrame, 550);
     warmUp().catch(() => {});
   }
 
   function stop() {
     stopCamera();
+    paused = true;
+    guide.classList.remove("ready", "scanning");
     video.srcObject = null;
     stage.classList.add("hidden");
     camBtn.classList.remove("hidden");
@@ -69,9 +179,15 @@ export function render(root) {
   }
 
   async function capture() {
-    if (!video.videoWidth) return;
+    if (!video.videoWidth || busy) return;
+    paused = true;
+    if (!lastCapturedFrame) {
+      try { lastCapturedFrame = sampleFrame(); } catch { /* manual capture still works */ }
+    }
     const g = guideRect(video.videoWidth, video.videoHeight);
-    await scan(autoCrop(toCanvas(video, g)));
+    // The guide is already a card-shaped crop. Auto-cropping it again sometimes
+    // cuts off the collector number or name, causing incorrect matches.
+    await scan(toCanvas(video, g));
   }
 
   async function onFile() {
@@ -83,11 +199,17 @@ export function render(root) {
     try { bmp = await createImageBitmap(f, { imageOrientation: "from-image" }); } catch { say("That image couldn't be opened.", "error"); return; }
     const c = autoCrop(toCanvas(bmp));
     bmp.close?.();
+    paused = true;
     await scan(c);
   }
 
   async function scan(canvas, { reader = "ocr" } = {}) {
+    if (busy) return;
+    busy = true;
+    paused = true;
     lastCanvas = canvas;
+    guide.classList.add("scanning");
+    try {
     mount(preview, h("img", { src: canvas.toDataURL("image/jpeg", 0.8), alt: "Captured card", class: "shot" }),
       h("div", { class: "row" },
         h("button", { class: "btn small", type: "button", onclick: () => scan(rotate(lastCanvas)) }, "Rotate ↻"),
@@ -120,6 +242,10 @@ export function render(root) {
       return scan(canvas, { reader: "ai" });
     }
     showResults(out, reader);
+    } finally {
+      busy = false;
+      guide.classList.remove("scanning");
+    }
   }
 
   function showResults({ read, matches }, reader) {
@@ -130,6 +256,7 @@ export function render(root) {
       read.hp?.length ? [" · HP ", h("code", {}, read.hp.join("/"))] : null);
     const guess = nameTokens(read.nameText)[0] || "";
     const actions = h("div", { class: "row" },
+      stream ? h("button", { class: "btn primary", type: "button", onclick: resumeAutoScan }, "Scan another card") : null,
       reader === "ocr" && getApiKey() ? h("button", { class: "btn", type: "button", onclick: () => scan(lastCanvas, { reader: "ai" }) }, "Not right? Read with Claude") : null,
       reader === "ocr" && !getApiKey() ? h("a", { class: "btn", href: "#/settings" }, "Add a Claude key for hard scans") : null,
       h("a", { class: "btn", href: `#/search?q=${encodeURIComponent(guess)}` }, "Search manually"));
@@ -152,8 +279,11 @@ export function render(root) {
     if (what === "added" && stream && state.settings.keepCamera) {
       results.replaceChildren();
       preview.replaceChildren();
-      say("Added. Ready for the next card.", "ok");
-      shotBtn.focus();
+      stableSamples = 0;
+      previousFrame = null;
+      paused = false;
+      needsNewCard = true;
+      say("Added. Replace the card to scan the next one automatically.", "ok");
     }
   }
 
@@ -166,7 +296,7 @@ export function render(root) {
   mount(root,
     h("section", { class: "panel" },
       h("h1", {}, "Scan a card"),
-      h("p", { class: "muted" }, "Point your camera at a card, or upload a photo. Text is read on this device; nothing is uploaded unless you choose Claude."),
+      h("p", { class: "muted" }, "Automatic scan: centre a card in the frame and hold it steady. The scanner reads without Capture; confirm the correct match before adding. Text stays on this device unless you choose Claude."),
       h("div", { class: "row" }, camBtn, shotBtn, stopBtn, h("label", { class: "btn", for: "scan-file" }, "Upload photo"), file),
       stage, status, preview, results));
 }
@@ -177,8 +307,12 @@ export function render(root) {
  */
 function isSure({ read, matches }) {
   const top = matches[0];
-  if (!top || top.score < 0.75 || !read.number || !sameNumber(top.localId, read.number)) return false;
-  return !matches[1] || top.raw - matches[1].raw >= 0.08;
+  if (!top || top.score < 0.82 || !read.number || !sameNumber(top.localId, read.number)) return false;
+  // A printed number alone is not a unique identity across expansions.
+  // Require matching card name AND printed set total before saying "Found it".
+  if (!read.total || !(top.set?.official === read.total || top.set?.total === read.total)) return false;
+  if (nameScore(top.name, read.nameText) < 0.78) return false;
+  return !matches[1] || top.raw - matches[1].raw >= 0.12;
 }
 
 /** Card-shaped region centred in the frame: 85% of the height, capped at 90% of the width. */
