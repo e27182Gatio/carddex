@@ -22,6 +22,8 @@ export function stopCamera() {
 }
 
 export function render(root) {
+  // Revisiting the Scan tab must not leave an invisible old camera/timer running.
+  stopCamera();
   const video = h("video", { playsinline: true, muted: true, autoplay: true, "aria-label": "Camera preview" });
   const guide = h("div", { class: "guide", "aria-hidden": "true" });
   const stage = h("div", { class: "camera hidden" }, video, guide);
@@ -30,9 +32,9 @@ export function render(root) {
   const preview = h("div", { class: "preview" });
   const file = h("input", { type: "file", accept: "image/*", capture: "environment", class: "visually-hidden", id: "scan-file" });
 
-  const camBtn = h("button", { class: "btn primary", type: "button" }, "Start camera");
-  const shotBtn = h("button", { class: "btn hidden", type: "button" }, "Capture manually");
-  const stopBtn = h("button", { class: "btn hidden", type: "button" }, "Stop camera");
+  const camBtn = h("button", { class: "btn primary", type: "button" }, "Iniciar cámara");
+  const shotBtn = h("button", { class: "btn hidden", type: "button" }, "Captura manual");
+  const stopBtn = h("button", { class: "btn hidden", type: "button" }, "Detener cámara");
 
   const say = (msg, kind = "") => {
     if (status.textContent === msg && status.className === `status ${kind}`) return;
@@ -320,9 +322,9 @@ export function render(root) {
 
   mount(root,
     h("section", { class: "panel" },
-      h("h1", {}, "Scan a card"),
+      h("h1", {}, "Escáner Pokémon · Auto V3"),
       h("p", { class: "muted" }, "Acerca la carta al recuadro y manténla visible. El escaneo se activa sin pulsar Capture. Comprueba la coincidencia antes de guardarla."),
-      h("div", { class: "row" }, camBtn, shotBtn, stopBtn, h("label", { class: "btn", for: "scan-file" }, "Upload photo"), file),
+      h("div", { class: "row" }, camBtn, shotBtn, stopBtn, h("label", { class: "btn", for: "scan-file" }, "Subir foto"), file),
       stage, status, preview, results));
 }
 
