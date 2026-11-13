@@ -1,7 +1,7 @@
 // Offline shell: same-origin files are served cache-first and refreshed in the
 // background. Cross-origin requests (card API, images, Claude) are never cached here.
 
-const CACHE = "carddex-v1";
+const CACHE = "carddex-v2-auto-scan";
 const SHELL = [
   "./", "index.html", "manifest.webmanifest", "css/styles.css", "icons/icon.svg",
   "js/app.js", "js/dom.js", "js/store.js", "js/api.js", "js/match.js", "js/identify.js", "js/ocr.js", "js/ai.js", "js/prices.js", "js/ui.js",
