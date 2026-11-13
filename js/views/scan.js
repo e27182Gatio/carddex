@@ -42,7 +42,7 @@ export function render(root) {
 
   // Analyze only a tiny frame: OCR starts after the card is sharp, well-lit and
   // steady. The full-resolution image is used for the actual recognition.
-  const ANALYSIS_W = 48, ANALYSIS_H = 68;
+  const ANALYSIS_W = 56, ANALYSIS_H = 80;
   const analysis = document.createElement("canvas");
   analysis.width = ANALYSIS_W;
   analysis.height = ANALYSIS_H;
@@ -67,7 +67,7 @@ export function render(root) {
     analysisCtx.drawImage(video, r.x, r.y, r.w, r.h, 0, 0, ANALYSIS_W, ANALYSIS_H);
     const rgba = analysisCtx.getImageData(0, 0, ANALYSIS_W, ANALYSIS_H).data;
     const pixels = new Uint8Array(ANALYSIS_W * ANALYSIS_H);
-    let brightness = 0, edges = 0, count = 0;
+    let brightness = 0, squares = 0, edges = 0, count = 0;
     for (let y = 0; y < ANALYSIS_H; y++) {
       for (let x = 0; x < ANALYSIS_W; x++) {
         const i = y * ANALYSIS_W + x;
@@ -75,13 +75,16 @@ export function render(root) {
         const v = Math.round(0.299 * rgba[p] + 0.587 * rgba[p + 1] + 0.114 * rgba[p + 2]);
         pixels[i] = v;
         brightness += v;
+        squares += v * v;
         if (x && y) {
           edges += (Math.abs(v - pixels[i - 1]) + Math.abs(v - pixels[i - ANALYSIS_W])) / 2;
           count++;
         }
       }
     }
-    return { pixels, brightness: brightness / pixels.length, detail: edges / Math.max(1, count) };
+    const avg = brightness / pixels.length;
+    const contrast = Math.sqrt(Math.max(0, squares / pixels.length - avg * avg));
+    return { pixels, brightness: avg, contrast, detail: edges / Math.max(1, count) };
   }
 
   function monitorFrame() {
@@ -92,7 +95,7 @@ export function render(root) {
 
     if (needsNewCard) {
       // After saving, don't immediately scan the same card a second time.
-      if (difference(frame.pixels, lastCapturedFrame?.pixels) < 18) {
+      if (difference(frame.pixels, lastCapturedFrame?.pixels) < 14) {
         previousFrame = frame;
         return;
       }
@@ -102,16 +105,19 @@ export function render(root) {
 
     const motion = difference(frame.pixels, previousFrame?.pixels);
     previousFrame = frame;
-    if (frame.brightness < 35 || frame.brightness > 235 || frame.detail < 8) {
+    // The earlier detail>=8 and motion<10 gates were too strict on phone
+    // previews: some real cards could never auto-trigger. Use contrast OR
+    // detail and tolerate normal hand-held movement.
+    if (frame.brightness < 22 || frame.brightness > 248 || (frame.contrast < 13 && frame.detail < 2.5)) {
       stableSamples = 0;
       guide.classList.remove("ready");
-      say("Auto scan: centre a well-lit card inside the outline.");
+      say("Enfoca una carta dentro del marco. La captura es automática.");
       return;
     }
-    stableSamples = motion < 10 ? stableSamples + 1 : 0;
+    stableSamples = motion < 23 ? stableSamples + 1 : 0;
     guide.classList.toggle("ready", stableSamples > 0);
     if (stableSamples < 2) {
-      say("Auto scan: hold the card steady inside the outline.");
+      say("Carta visible: mantenla centrada un instante.");
       return;
     }
     paused = true;
@@ -131,7 +137,17 @@ export function render(root) {
     results.replaceChildren();
     preview.replaceChildren();
     guide.classList.remove("scanning", "ready");
-    say("Auto scan ready. Hold a card steady in the outline.");
+    say("Escaneo automático activado: encuadra la siguiente carta.");
+  }
+
+  function retryWhenMoved() {
+    if (!stream) return;
+    previousFrame = null;
+    stableSamples = 0;
+    paused = false;
+    needsNewCard = true; // Avoid a loop of OCR reads on the same bad image.
+    guide.classList.remove("scanning", "ready");
+    say("No se reconoció. Mueve o acerca la carta para reintentar automáticamente.");
   }
 
   function layoutGuide() {
@@ -161,9 +177,9 @@ export function render(root) {
     needsNewCard = false;
     previousFrame = null;
     stableSamples = 0;
-    say("Auto scan enabled. Centre the card and hold it steady — no tap needed.");
+    say("Escaneo automático activo. Encuadra una carta; no pulses Capture.");
     if (autoTimer != null) clearInterval(autoTimer);
-    autoTimer = setInterval(monitorFrame, 550);
+    autoTimer = setInterval(monitorFrame, 250);
     warmUp().catch(() => {});
   }
 
@@ -225,7 +241,8 @@ export function render(root) {
         });
       }
     } catch (e) {
-      say(e.message || "Couldn't read the card.", "error");
+      say(e.message || "No se pudo leer la carta.", "error");
+      if (stream) retryWhenMoved();
       return;
     }
     let out;
@@ -233,6 +250,7 @@ export function render(root) {
       out = await identify(read, (msg) => say(msg));
     } catch (e) {
       say(e.message, "error");
+      if (stream) retryWhenMoved();
       return;
     }
     if (!isSure(out) && reader === "ocr" && state.settings.autoAi && getApiKey()) {
@@ -270,6 +288,7 @@ export function render(root) {
     if (!matches.length) {
       say("No matching card found. Try better light, hold the card flat, or search manually.", "error");
       mount(results, readLine, actions);
+      if (stream && reader === "ocr") retryWhenMoved();
       return;
     }
     const sure = isSure({ read, matches });
@@ -289,7 +308,7 @@ export function render(root) {
       previousFrame = null;
       paused = false;
       needsNewCard = true;
-      say("Added. Replace the card to scan the next one automatically.", "ok");
+      say("Carta guardada. Cambia la carta: la próxima se escaneará sola.", "ok");
     }
   }
 
@@ -302,7 +321,7 @@ export function render(root) {
   mount(root,
     h("section", { class: "panel" },
       h("h1", {}, "Scan a card"),
-      h("p", { class: "muted" }, "Automatic scan: centre a card in the frame and hold it steady. The scanner reads without Capture; confirm the correct match before adding. Text stays on this device unless you choose Claude."),
+      h("p", { class: "muted" }, "Acerca la carta al recuadro y manténla visible. El escaneo se activa sin pulsar Capture. Comprueba la coincidencia antes de guardarla."),
       h("div", { class: "row" }, camBtn, shotBtn, stopBtn, h("label", { class: "btn", for: "scan-file" }, "Upload photo"), file),
       stage, status, preview, results));
 }
