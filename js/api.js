@@ -85,9 +85,10 @@ export async function getSetCard(setId, number) {
 }
 
 /** Search cards. Name matching is TCGdex's "contains" filter. */
-export async function searchCards({ name = "", setId = "", type = "", rarity = "", page = 1, perPage = 30 } = {}) {
+export async function searchCards({ name = "", localId = "", setId = "", type = "", rarity = "", page = 1, perPage = 30 } = {}) {
   const q = new URLSearchParams();
   if (name) q.set("name", name.slice(0, 60));
+  if (localId) q.set("localId", localId.slice(0, 12));
   if (setId) q.set("set.id", setId.slice(0, 40));
   if (type) q.set("types", type.slice(0, 20));
   if (rarity) q.set("rarity", rarity.slice(0, 40));
