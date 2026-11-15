@@ -2,12 +2,13 @@
 // Claude vision is offered as a second reader when OCR can't find the card.
 
 import { readWithClaude } from "../ai.js";
-import { h, mount } from "../dom.js";
+import { cardImg, h, mount } from "../dom.js";
+import { detectCard, frameHash, frameMovement, hashDistance } from "../card-detect.js";
 import { identify } from "../identify.js";
 import { nameScore, nameTokens, sameNumber } from "../match.js";
 import { autoCrop, readCard, toCanvas, warmUp } from "../ocr.js";
 import { getApiKey, ownedIds, state } from "../store.js";
-import { cardSheet, cardTile } from "../ui.js";
+import { cardSheet, cardTile, openCard } from "../ui.js";
 
 const CARD_RATIO = 63 / 88;
 let stream = null;
@@ -30,6 +31,7 @@ export function render(root) {
   const status = h("div", { class: "status", role: "status", "aria-live": "polite" });
   const results = h("div", { class: "results" });
   const preview = h("div", { class: "preview" });
+  const recentHost = h("div", { class: "recent-scans" });
   const file = h("input", { type: "file", accept: "image/*", capture: "environment", class: "visually-hidden", id: "scan-file" });
 
   const camBtn = h("button", { class: "btn primary", type: "button" }, "Iniciar cámara");
@@ -42,19 +44,25 @@ export function render(root) {
     status.textContent = msg;
   };
 
-  // Analyze only a tiny frame: OCR starts after the card is sharp, well-lit and
-  // steady. The full-resolution image is used for the actual recognition.
-  const ANALYSIS_W = 56, ANALYSIS_H = 80;
+  // Sample a small region with a margin around the guide to find real edges.
+  // Large-resolution images are only processed after a card has been detected.
+  const ANALYSIS_W = 144, ANALYSIS_H = 192;
   const analysis = document.createElement("canvas");
   analysis.width = ANALYSIS_W;
   analysis.height = ANALYSIS_H;
   const analysisCtx = analysis.getContext("2d", { willReadFrequently: true });
   let previousFrame = null;
-  let lastCapturedFrame = null;
+  let previousBox = null;
   let stableSamples = 0;
   let busy = false;
-  let paused = false;
-  let needsNewCard = false;
+  let paused = false; // used only for manual file or explicit review operations
+  let armed = true;
+  let lostFrames = 0;
+  let lastHash = null;
+  let lastShotAt = 0;
+  let lastSampleAt = 0;
+  const recent = []; // session history, never silently saved to the collection
+  let activeRun = 0;
 
   function difference(a, b) {
     if (!a || !b) return Infinity;
@@ -64,92 +72,153 @@ export function render(root) {
   }
 
   function sampleFrame() {
-    if (!video.videoWidth || !video.videoHeight) return null;
-    const r = guideRect(video.videoWidth, video.videoHeight);
-    analysisCtx.drawImage(video, r.x, r.y, r.w, r.h, 0, 0, ANALYSIS_W, ANALYSIS_H);
+    const vw = video.videoWidth, vh = video.videoHeight;
+    if (!vw || !vh) return null;
+    const g = guideRect(vw, vh);
+    // Include background around the guide: a card's four outer edges must
+    // be visible. This distinguishes a card from random printed textures.
+    const x0 = Math.max(0, g.x - g.w * .16);
+    const y0 = Math.max(0, g.y - g.h * .16);
+    const x1 = Math.min(vw, g.x + g.w * 1.16);
+    const y1 = Math.min(vh, g.y + g.h * 1.16);
+    const roi = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+    analysisCtx.drawImage(video, roi.x, roi.y, roi.w, roi.h,
+      0, 0, ANALYSIS_W, ANALYSIS_H);
     const rgba = analysisCtx.getImageData(0, 0, ANALYSIS_W, ANALYSIS_H).data;
-    const pixels = new Uint8Array(ANALYSIS_W * ANALYSIS_H);
-    let brightness = 0, squares = 0, edges = 0, count = 0;
-    for (let y = 0; y < ANALYSIS_H; y++) {
-      for (let x = 0; x < ANALYSIS_W; x++) {
-        const i = y * ANALYSIS_W + x;
-        const p = i * 4;
-        const v = Math.round(0.299 * rgba[p] + 0.587 * rgba[p + 1] + 0.114 * rgba[p + 2]);
-        pixels[i] = v;
-        brightness += v;
-        squares += v * v;
-        if (x && y) {
-          edges += (Math.abs(v - pixels[i - 1]) + Math.abs(v - pixels[i - ANALYSIS_W])) / 2;
-          count++;
-        }
-      }
+    const gray = new Uint8Array(ANALYSIS_W * ANALYSIS_H);
+    for (let i = 0; i < gray.length; i++) {
+      const k = i * 4;
+      gray[i] = Math.round(.299 * rgba[k] + .587 * rgba[k + 1] + .114 * rgba[k + 2]);
     }
-    const avg = brightness / pixels.length;
-    const contrast = Math.sqrt(Math.max(0, squares / pixels.length - avg * avg));
-    return { pixels, brightness: avg, contrast, detail: edges / Math.max(1, count) };
+    const detected = detectCard(gray, ANALYSIS_W, ANALYSIS_H, roi.w / roi.h);
+    if (!detected) return { gray, detected: null };
+    const r = detected.box;
+    const source = {
+      x: roi.x + r.x * roi.w / ANALYSIS_W,
+      y: roi.y + r.y * roi.h / ANALYSIS_H,
+      w: r.w * roi.w / ANALYSIS_W,
+      h: r.h * roi.h / ANALYSIS_H
+    };
+    // Keep a small border to avoid cutting off printed name/collector number.
+    const padX = source.w * .02, padY = source.h * .02;
+    const crop = {
+      x: Math.max(0, source.x - padX),
+      y: Math.max(0, source.y - padY),
+      w: Math.min(vw, source.x + source.w + padX) - Math.max(0, source.x - padX),
+      h: Math.min(vh, source.y + source.h + padY) - Math.max(0, source.y - padY),
+    };
+    return { gray, detected, crop,
+      hash: frameHash(gray, ANALYSIS_W, ANALYSIS_H, r) };
+  }
+
+  function updateRecent() {
+    if (!recent.length) { recentHost.replaceChildren(); return; }
+    mount(recentHost,
+      h("h3", {}, "Últimas detecciones (sin guardar)"),
+      h("p", { class: "muted small" },
+        "Revisa las coincidencias. Ninguna carta se añade al inventario automáticamente."),
+      ...recent.map((item) => h("div", { class: "recent-item" },
+        cardImg(item.card.image, item.card.name),
+        h("div", { class: "recent-info" },
+          h("strong", {}, item.card.name),
+          h("span", { class: "muted small" },
+            [item.card.set?.name, item.card.localId && "#" + item.card.localId].filter(Boolean).join(" · ")),
+          h("span", { class: "small" }, item.sure ? "Coincidencia probable" : "Revisar coincidencia"),
+          h("div", { class: "row tight" },
+            h("button", { class: "btn small", type: "button",
+              onclick: () => openCard(item.card.id, afterAdd) }, "Revisar / añadir"),
+            h("button", { class: "btn small", type: "button", onclick: () => {
+              const i = recent.indexOf(item);
+              if (i >= 0) recent.splice(i, 1);
+              updateRecent();
+            } }, "Descartar"))))));
+  }
+
+  function rememberResult(card, sure) {
+    // A transient session list prevents an unsaved result from disappearing
+    // when the next card comes into view; the collection remains unchanged.
+    if (recent.length && recent[0].card.id === card.id) return;
+    recent.unshift({ card, sure });
+    if (recent.length > 12) recent.length = 12;
+    updateRecent();
   }
 
   function monitorFrame() {
-    if (!stream || busy || paused || document.hidden) return;
+    if (!stream || busy || paused || document.hidden || document.body.classList.contains("modal-open")) return;
+    // Throttle analysis even if the browser calls timers faster than expected.
+    if (Date.now() - lastSampleAt < 260) return;
+    lastSampleAt = Date.now();
     let frame;
     try { frame = sampleFrame(); } catch { return; }
     if (!frame) return;
-
-    if (needsNewCard) {
-      // After saving, don't immediately scan the same card a second time.
-      if (difference(frame.pixels, lastCapturedFrame?.pixels) < 14) {
-        previousFrame = frame;
+    if (!frame.detected) {
+      lostFrames++;
+      stableSamples = 0;
+      previousFrame = null;
+      previousBox = null;
+      guide.classList.remove("ready");
+      if (lostFrames >= 2) {
+        armed = true;
+        lastHash = null;
+      }
+      say("Encuadra los cuatro bordes de la carta para capturarla automáticamente.");
+      return;
+    }
+    lostFrames = 0;
+    if (!armed) {
+      // Do not scan the same card again just because the hand/camera moved.
+      if (hashDistance(frame.hash, lastHash) < 20) {
+        say("Carta detectada. Retírala o cambia por otra para continuar.", "ok");
         return;
       }
-      needsNewCard = false;
+      armed = true;
       previousFrame = null;
+      previousBox = null;
+      stableSamples = 0;
     }
 
-    const motion = difference(frame.pixels, previousFrame?.pixels);
-    previousFrame = frame;
-    // The earlier detail>=8 and motion<10 gates were too strict on phone
-    // previews: some real cards could never auto-trigger. Use contrast OR
-    // detail and tolerate normal hand-held movement.
-    if (frame.brightness < 22 || frame.brightness > 248 || (frame.contrast < 13 && frame.detail < 2.5)) {
-      stableSamples = 0;
-      guide.classList.remove("ready");
-      say("Enfoca una carta dentro del marco. La captura es automática.");
-      return;
-    }
-    stableSamples = motion < 23 ? stableSamples + 1 : 0;
+    const box = frame.detected.box;
+    const geometry = previousBox
+      ? Math.abs(box.x - previousBox.x) + Math.abs(box.y - previousBox.y) +
+        Math.abs(box.w - previousBox.w) + Math.abs(box.h - previousBox.h)
+      : Infinity;
+    const movement = frameMovement(frame.gray, previousFrame);
+    stableSamples = movement < 21 && geometry < 14 ? stableSamples + 1 : 0;
+    previousFrame = frame.gray;
+    previousBox = box;
     guide.classList.toggle("ready", stableSamples > 0);
     if (stableSamples < 2) {
-      say("Carta visible: mantenla centrada un instante.");
+      say("Carta detectada: mantenla inmóvil un instante.");
       return;
     }
-    paused = true;
+    if (Date.now() - lastShotAt < 850) return;
+    armed = false;
     stableSamples = 0;
-    lastCapturedFrame = frame;
+    lastHash = frame.hash;
+    lastShotAt = Date.now();
     guide.classList.remove("ready");
-    guide.classList.add("scanning");
-    capture();
+    capture(frame.crop, true);
   }
 
   function resumeAutoScan() {
     if (!stream || busy) return;
     previousFrame = null;
+    previousBox = null;
     stableSamples = 0;
+    armed = true;
+    lastHash = null;
     paused = false;
-    needsNewCard = false;
     results.replaceChildren();
     preview.replaceChildren();
     guide.classList.remove("scanning", "ready");
-    say("Escaneo automático activado: encuadra la siguiente carta.");
+    say("Detección activa: encuadra la carta para volver a intentar.");
   }
 
   function retryWhenMoved() {
     if (!stream) return;
-    previousFrame = null;
-    stableSamples = 0;
     paused = false;
-    needsNewCard = true; // Avoid a loop of OCR reads on the same bad image.
     guide.classList.remove("scanning", "ready");
-    say("No se reconoció. Mueve o acerca la carta para reintentar automáticamente.");
+    say("Sin coincidencia segura. Mueve o reemplaza la carta para reintentar.");
   }
 
   function layoutGuide() {
@@ -175,13 +244,17 @@ export function render(root) {
     camBtn.classList.add("hidden");
     shotBtn.classList.remove("hidden");
     stopBtn.classList.remove("hidden");
+    activeRun++;
     paused = false;
-    needsNewCard = false;
+    armed = true;
     previousFrame = null;
+    previousBox = null;
     stableSamples = 0;
-    say("Escaneo automático activo. Encuadra una carta; no pulses Capture.");
+    lostFrames = 0;
+    lastHash = null;
+    say("Detección automática V4: muestra los cuatro bordes de una carta.");
     if (autoTimer != null) clearInterval(autoTimer);
-    autoTimer = setInterval(monitorFrame, 250);
+    autoTimer = setInterval(monitorFrame, 300);
     warmUp().catch(() => {});
   }
 
@@ -196,14 +269,16 @@ export function render(root) {
     stopBtn.classList.add("hidden");
   }
 
-  async function capture() {
+  async function capture(crop = null, automatic = false) {
     if (!video.videoWidth || busy) return;
-    paused = true;
-    try { lastCapturedFrame = sampleFrame(); } catch { /* manual capture still works */ }
-    const g = guideRect(video.videoWidth, video.videoHeight);
-    // The guide is already a card-shaped crop. Auto-cropping it again sometimes
-    // cuts off the collector number or name, causing incorrect matches.
-    await scan(toCanvas(video, g));
+    if (!automatic) {
+      // Manual capture always works even if no rectangular boundary is found.
+      const frame = sampleFrame();
+      if (frame?.hash) lastHash = frame.hash;
+      armed = false;
+    }
+    const g = crop || guideRect(video.videoWidth, video.videoHeight);
+    await scan(toCanvas(video, g), { automatic });
   }
 
   async function onFile() {
@@ -215,14 +290,13 @@ export function render(root) {
     try { bmp = await createImageBitmap(f, { imageOrientation: "from-image" }); } catch { say("That image couldn't be opened.", "error"); return; }
     const c = autoCrop(toCanvas(bmp));
     bmp.close?.();
-    paused = true;
     await scan(c);
   }
 
-  async function scan(canvas, { reader = "ocr" } = {}) {
+  async function scan(canvas, { reader = "ocr", automatic = false } = {}) {
     if (busy) return;
     busy = true;
-    paused = true;
+    const run = activeRun;
     lastCanvas = canvas;
     guide.classList.add("scanning");
     try {
@@ -260,21 +334,21 @@ export function render(root) {
       try {
         const aiRead = await readWithClaude(canvas, state.settings.model);
         const aiOut = await identify(aiRead, (msg) => say(msg));
-        showResults(aiOut, "ai");
+        if (run === activeRun) showResults(aiOut, "ai", automatic);
       } catch (e) {
         say("Claude could not verify this card; review the OCR alternatives.", "error");
-        showResults(out, reader);
+        if (run === activeRun) showResults(out, reader, automatic);
       }
       return;
     }
-    showResults(out, reader);
+    if (run === activeRun) showResults(out, reader, automatic);
     } finally {
       busy = false;
       guide.classList.remove("scanning");
     }
   }
 
-  function showResults({ read, matches }, reader) {
+  function showResults({ read, matches }, reader, automatic = false) {
     const owned = ownedIds();
     const readLine = h("p", { class: "muted small" }, `Read${reader === "ai" ? " by Claude" : ""}: `,
       h("code", {}, (read.nameText || "—").replace(/\s+/g, " ").slice(0, 60)), " · number ",
@@ -296,6 +370,7 @@ export function render(root) {
     const sure = isSure({ read, matches });
     say(sure ? "Found it." : "Best guess below. Check it's the right card, or pick another.", sure ? "ok" : "");
     const best = matches[0];
+    if (automatic) rememberResult(best, sure);
     mount(results, readLine,
       h("div", { class: "best" }, cardSheet(best, afterAdd)),
       matches.length > 1 ? [h("h3", {}, "Other possibilities"), h("div", { class: "grid" }, matches.slice(1).map((c) => cardTile(c, { owned: owned.has(c.id), score: c.score })))] : null,
@@ -303,29 +378,24 @@ export function render(root) {
   }
 
   function afterAdd(what) {
-    if (what === "added" && stream && state.settings.keepCamera) {
-      results.replaceChildren();
-      preview.replaceChildren();
-      stableSamples = 0;
-      previousFrame = null;
-      paused = false;
-      needsNewCard = true;
-      say("Carta guardada. Cambia la carta: la próxima se escaneará sola.", "ok");
-    }
+    if (what !== "added" || !stream) return;
+    if (!state.settings.keepCamera) { stop(); return; }
+    paused = false;
+    say("Guardada. La cámara sigue activa; enseña una carta diferente.", "ok");
   }
 
   camBtn.addEventListener("click", startCamera);
-  shotBtn.addEventListener("click", capture);
+  shotBtn.addEventListener("click", () => capture());
   stopBtn.addEventListener("click", stop);
   file.addEventListener("change", onFile);
   addEventListener("resize", layoutGuide);
 
   mount(root,
     h("section", { class: "panel" },
-      h("h1", {}, "Escáner Pokémon · Auto V3"),
-      h("p", { class: "muted" }, "Acerca la carta al recuadro y manténla visible. El escaneo se activa sin pulsar Capture. Comprueba la coincidencia antes de guardarla."),
+      h("h1", {}, "Escáner Pokémon · Fase 1 V4"),
+      h("p", { class: "muted" }, "Muestra los cuatro bordes de una carta y mantenla estable. La cámara seguirá abierta para la siguiente; revisa el resultado antes de guardarlo."),
       h("div", { class: "row" }, camBtn, shotBtn, stopBtn, h("label", { class: "btn", for: "scan-file" }, "Subir foto"), file),
-      stage, status, preview, results));
+      stage, status, preview, results, recentHost));
 }
 
 /**
