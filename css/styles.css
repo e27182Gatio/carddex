@@ -214,3 +214,12 @@ main { flex: 1; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 @media (prefers-reduced-motion: no-preference) {
   .btn, .tile, .set-row { transition: border-color .15s; }
 }
+
+// Phase 1 V4: compact session-only results; never auto-save a guessed card.
+.recent-scans { max-width: 640px; margin-top: 1rem; }
+.recent-item { display: flex; align-items: center; gap: .8rem; padding: .65rem 0; border-top: 1px solid var(--line); }
+.recent-item .card-img { width: 65px; height: 91px; flex-shrink: 0; object-fit: contain; }
+.recent-info { display: flex; flex-direction: column; min-width: 0; flex: 1; gap: 2px; }
+.recent-info .row { margin: .25rem 0 0; }
+.guide.ready { border-color: #22c55e; border-width: 4px; }
+.guide.scanning { border-color: #38bdf8; }
